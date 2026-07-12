@@ -1,9 +1,19 @@
-import re
-from dateutil.parser import parse
+import json
+import os
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from google import genai
+from google.genai import types
+
+load_dotenv()
+
+client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY")
+)
 
 app = FastAPI()
 
@@ -20,95 +30,118 @@ class InvoiceRequest(BaseModel):
     invoice_text: str
 
 
-def first_match(patterns, text):
-    for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-        if m:
-            return m.group(1).strip()
-    return None
-
-
-def parse_amount(value):
-    if value is None:
-        return None
-
-    value = re.sub(r"[^\d.,-]", "", value)
-    value = value.replace(",", "")
-
-    try:
-        return float(value)
-    except:
-        return None
-
-
 @app.get("/")
-def home():
+def root():
     return {"status": "running"}
 
 
 @app.post("/extract")
 def extract(req: InvoiceRequest):
 
-    text = req.invoice_text
+    prompt = f"""
+You are an expert invoice information extraction system.
 
-    invoice_no = first_match([
-        r"Invoice\s*(?:No|Number)?\s*[:#]?\s*([A-Za-z0-9/\-]+)",
-        r"Invoice\s*#\s*([A-Za-z0-9/\-]+)",
-        r"Ref(?:erence)?\s*[:#]?\s*([A-Za-z0-9/\-]+)",
-    ], text)
+Extract information ONLY from the invoice text below.
 
-    vendor = first_match([
-        r"Vendor\s*[:#]?\s*(.+)",
-        r"Seller\s*[:#]?\s*(.+)",
-        r"Supplier\s*[:#]?\s*(.+)",
-        r"From\s*[:#]?\s*(.+)",
-    ], text)
+Invoice Text:
 
-    date_text = first_match([
-        r"Invoice Date\s*[:#]?\s*(.+)",
-        r"Date\s*[:#]?\s*(.+)",
-        r"Issued\s*[:#]?\s*(.+)",
-    ], text)
+{req.invoice_text}
 
-    date = None
+Return ONLY valid JSON.
 
-    if date_text:
-        try:
-            date = parse(date_text, dayfirst=True).date().isoformat()
-        except:
-            pass
+The JSON MUST contain exactly these six keys:
 
-    subtotal = first_match([
-        r"Subtotal\s*[:#]?\s*(.+)",
-        r"Net Amount\s*[:#]?\s*(.+)",
-        r"Amount Before Tax\s*[:#]?\s*(.+)",
-    ], text)
+{{
+  "invoice_no": string | null,
+  "date": string | null,
+  "vendor": string | null,
+  "amount": number | null,
+  "tax": number | null,
+  "currency": string | null
+}}
 
-    tax = first_match([
-        r"GST[^\n]*[:#]?\s*(.+)",
-        r"IGST[^\n]*[:#]?\s*(.+)",
-        r"CGST[^\n]*[:#]?\s*(.+)",
-        r"SGST[^\n]*[:#]?\s*(.+)",
-        r"VAT[^\n]*[:#]?\s*(.+)",
-        r"Tax[^\n]*[:#]?\s*(.+)",
-    ], text)
+Rules:
 
-    currency = None
+1. invoice_no
+- Extract only the invoice identifier.
+- Remove labels like:
+  - Invoice No
+  - Invoice Number
+  - Invoice #
+  - Ref
+  - Reference
+  - Bill No
+- Example:
+    Ref: UV-8810
+becomes
+    "UV-8810"
 
-    if re.search(r"\bINR\b|Rs\.?|₹", text, re.IGNORECASE):
-        currency = "INR"
-    elif re.search(r"\bUSD\b|\$", text):
-        currency = "USD"
-    elif re.search(r"\bEUR\b|€", text):
-        currency = "EUR"
-    elif re.search(r"\bGBP\b|£", text):
-        currency = "GBP"
+2. date
+Return in ISO format:
+YYYY-MM-DD
+
+3. vendor
+Return ONLY the company/vendor/seller/supplier name.
+
+4. amount
+Return ONLY the subtotal BEFORE tax.
+
+Never return the grand total.
+
+5. tax
+Return ONLY the tax amount.
+
+Ignore total.
+
+6. currency
+
+Return ISO currency code.
+
+Examples:
+
+Rs
+₹
+INR
+-> INR
+
+$
+USD
+-> USD
+
+€
+EUR
+-> EUR
+
+£
+GBP
+-> GBP
+
+If a field is missing return null.
+
+Do NOT wrap the JSON in markdown.
+
+Return ONLY JSON.
+"""
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0,
+            response_mime_type="application/json",
+        ),
+    )
+
+    try:
+        data = json.loads(response.text)
+    except Exception:
+        data = {}
 
     return {
-        "invoice_no": invoice_no,
-        "date": date,
-        "vendor": vendor,
-        "amount": parse_amount(subtotal),
-        "tax": parse_amount(tax),
-        "currency": currency,
+        "invoice_no": data.get("invoice_no"),
+        "date": data.get("date"),
+        "vendor": data.get("vendor"),
+        "amount": data.get("amount"),
+        "tax": data.get("tax"),
+        "currency": data.get("currency"),
     }
